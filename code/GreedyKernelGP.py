@@ -57,14 +57,15 @@ class GreedyKernelSearchGP(GaussianProcess):
                     else:
                         combined_kernel = self.base_kernel * kernel
 
-                    print(layer," : ", combined_kernel.kernel_name, " ", combined_kernel.param_values)
+                    print(layer," : ", combined_kernel.kernel_name)
 
                     _ = GaussianProcess(kernel=combined_kernel, sigma_n=self.sigma_n, optimizer=self.optimizer, **self.optimizer_kwargs)
                     _.fit(X, y)
 
-                    lml = _._log_marginal_likelihood(_.kernel.param_values)
+                    lml = _.LML_
                     current_bic = self.bic(lml, combined_kernel.num_params)
-
+                    
+                    print(" with parameters: ", _.kernel.param_values)
                     print(" with bic: ", current_bic)
 
                     if current_bic < best_bic:
@@ -77,6 +78,8 @@ class GreedyKernelSearchGP(GaussianProcess):
         super().__init__(self.base_kernel, self.sigma_n, self.optimizer, **self.optimizer_kwargs)
 
         super().fit(X, y)
+
+
 
     def predict(self, X_star, return_cov=False):
         self.kernel = self.base_kernel

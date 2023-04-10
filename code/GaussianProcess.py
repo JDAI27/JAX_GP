@@ -45,7 +45,7 @@ class GaussianProcess:
     def adam_optimizer(self, obj_func, initial_theta, bounds, num_epochs=1000, step_size=0.01, beta1=0.9, beta2=0.999, eps=1e-8):
         opt_init, opt_update, get_params = optimizers.adam(step_size=step_size, b1=beta1, b2=beta2, eps=eps)
         state = opt_init(initial_theta)
-        bounds = jnp.log(jnp.array(bounds))
+        #bounds = jnp.log(jnp.array(bounds))
 
         # Define a single optimization step
         @jit
@@ -97,12 +97,13 @@ class GaussianProcess:
     # Compute the loss and gradients of the log-marginal likelihood given kernel parameters
     @partial(jit, static_argnums=(0,))
     def _loss_and_grads(self, params):
+        #params = jnp.exp(params)
         #Assign the kernel parameters
         #self.kernel.param_values = jnp.exp(params)
         #self.kernel.param_values = params
 
         #Compute the covariance matrix (K) using the kernel function and add the noise term
-        K = self.kernel.kernel_function(self.X_train, self.X_train,params) + self.sigma_n**2 * jnp.eye(len(self.X_train))
+        K = self.kernel.kernel_function(self.X_train, self.X_train, params) + self.sigma_n**2 * jnp.eye(self.X_train.shape[0])
 
         # Compute the Cholesky decomposition (L) of the covariance matrix (K). 
         # If the decomposition fails, return -inf for the log-marginal likelihood and a zero gradient.
@@ -115,7 +116,7 @@ class GaussianProcess:
         alpha = cho_solve((L, True), self.y_train)
         log_marginal_likelihood = -0.5 * jnp.dot(self.y_train, alpha) - jnp.sum(jnp.log(jnp.diag(L))) - len(self.X_train) * 0.5 * jnp.log(2 * jnp.pi)
 
-        K_gradient = self.kernel.kernel_gradient(self.X_train, self.X_train,params)#*jnp.exp(params)
+        K_gradient = self.kernel.kernel_gradient(self.X_train, self.X_train,params) #*params
         V = cho_solve((L, True), jnp.eye(K.shape[0])) [..., jnp.newaxis]
         log_marginal_likelihood_gradient = -0.5 * jnp.einsum("ijk,ijk->k", V, K_gradient)
 
@@ -160,12 +161,12 @@ class GaussianProcess:
     def _optimize_kernel_params(self):
         def obj_func(params,):
             if self.kernel.eval_gradient:
-                #loss_val, grads = self._loss_and_grads(params)
-                loss_val, grads = self.nll_value_and_grad(params)
+                loss_val, grads = self._loss_and_grads(params)
+                #loss_val, grads = self.nll_value_and_grad(params)
                 return loss_val, grads
             else:
-                #loss_val, _ = self._loss_and_grads(params)
-                loss_val, _ = self.nll_value_and_grad(params)
+                loss_val, _ = self._loss_and_grads(params)
+                #loss_val, _ = self.nll_value_and_grad(params)
                 return loss_val
 
         initial_theta = self.kernel.param_values
