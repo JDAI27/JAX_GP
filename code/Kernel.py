@@ -1,6 +1,6 @@
 import jax.numpy as jnp
 #import numpy as np
-from jax import jacfwd, jit
+from jax import jacfwd,grad, jit, vmap
 from functools import partial
 
 
@@ -25,15 +25,24 @@ class Kernel:
             which computes the forward-mode Jacobian of the kernel_function with respect to the kernel parameters.
         '''
 
-        self.kernel_function = kernel_function
+        #kernel_function = jit(kernel_function)
+        if kernel_function.__name__ == "_combined_kernel_function":
+            self.kernel_function = kernel_function
+        else:
+            mv = vmap(kernel_function, (0, None, None), 0)
+            self.kernel_function = vmap (mv, (None, 0, None), 1)
         self.kernel_name = kernel_name
         self.num_params = num_params
         self.param_values = jnp.array(param_values)
         self.param_bounds = param_bounds
         self.eval_gradient = eval_gradient
 
-        if eval_gradient:
-            self.kernel_gradient = jit(jacfwd(kernel_function,argnums=2))
+        if eval_gradient and kernel_function.__name__ != "_combined_kernel_function":
+            #self.kernel_gradient = jit(jacfwd(kernel_function,argnums=2))
+            #self.kernel_gradient = jit(jacrev(kernel_function,argnums=2))
+            g_kernel = jit(grad(kernel_function, argnums=2))
+            mv = vmap(g_kernel, (0, None, None), 0)
+            self.kernel_gradient = vmap (mv, (None, 0, None), 1)
 
     def __call__(self, X1, X2):
         """It computes the kernel function with the given input points X1 and X2 and the current kernel parameter values."""
@@ -56,6 +65,8 @@ class KernelOperation(Kernel):
         # Initialize the two input kernels
         self.kernel1 = kernel1
         self.kernel2 = kernel2
+        self.k1_num = kernel1.num_params
+        self.k2_num = kernel2.num_params
 
         # Calculate the combined number of parameters, parameter values, and parameter bounds
         num_params = kernel1.num_params + kernel2.num_params
@@ -67,8 +78,8 @@ class KernelOperation(Kernel):
 
     @partial(jit, static_argnums=(0,))
     def gradient(self, X1, X2):
-        g1 = self.kernel1.gradient(X1, X2)
-        g2 = self.kernel2.gradient(X1, X2)
+        g1 = self.kernel1.kernel_gradient(X1, X2,self.param_values[:self.k1_num])
+        g2 = self.kernel2.kernel_gradient(X1, X2,self.param_values[self.k1_num:])
         return self._combined_kernel_gradient(X1, X2, g1, g2)
 
     def _combined_kernel_function(self, X1, X2, params):
@@ -83,38 +94,43 @@ class KernelOperation(Kernel):
 class KernelSum(KernelOperation):
     @partial(jit, static_argnums=(0,))
     def _combined_kernel_function(self, X1, X2, params):
-        return self.kernel1(X1, X2) + self.kernel2(X1, X2)
+        return self.kernel1.kernel_function(X1, X2,params[:self.k1_num]) + self.kernel2.kernel_function(X1, X2,params[self.k1_num:])
 
     @partial(jit, static_argnums=(0,))
     def _combined_kernel_gradient(self, X1, X2, g1, g2):
         return jnp.append(g1, g2,axis=2)
     
     def _combined_kernel_name(self,):
+        self.kernel_gradient = jit(lambda X1, X2, params: jnp.append(self.kernel1.kernel_gradient(X1, X2,params[:self.k1_num]),
+                                                                self.kernel2.kernel_gradient(X1, X2,params[self.k1_num:]),axis=2))
         return self.kernel1.kernel_name+'+'+self.kernel2.kernel_name
 
 
 class KernelProduct(KernelOperation):
     @partial(jit, static_argnums=(0,))
     def _combined_kernel_function(self, X1, X2, params):
-        return self.kernel1(X1, X2) * self.kernel2(X1, X2)
+        return self.kernel1.kernel_function(X1, X2,params[:self.k1_num]) * self.kernel2.kernel_function(X1, X2,params[self.k1_num:])
 
     @partial(jit, static_argnums=(0,))
     def _combined_kernel_gradient(self, X1, X2, g1, g2):
-        return jnp.append(self.kernel1(X1, X2)[:,:, None] * g2, self.kernel2(X1, X2)[:,:, None] * g1,axis=2)
+        return jnp.append(self.kernel1.kernel_function(X1, X2,self.param_values[:self.k1_num])[:,:,jnp.newaxis] * g2, 
+                          self.kernel2.kernel_function(X1, X2,self.param_values[self.k1_num:][:,:,jnp.newaxis] * g1,axis=2))
     
     def _combined_kernel_name(self,):
-        return self.kernel1.kernel_name+'* ('+self.kernel2.kernel_name +" )"
+        self.kernel_gradient = jit(lambda X1, X2, params: jnp.append(self.kernel1.kernel_function(X1, X2,params[:self.k1_num])[:,:,jnp.newaxis] * self.kernel2.kernel_gradient(X1, X2,params[self.k1_num:]), 
+                          self.kernel2.kernel_function(X1, X2,params[self.k1_num:])[:,:,jnp.newaxis] * self.kernel1.kernel_gradient(X1, X2,params[:self.k1_num]),axis=2))
+        return '('+self.kernel1.kernel_name+') * ('+self.kernel2.kernel_name +')'
 
 
 def rbf_kernel(X1, X2, params):
     params = jnp.array(params)
     if len(params) == 1:
         # isotropic RBF kernel with length scale = params[0]
-        sq_norm = jnp.sum((X1[:, jnp.newaxis, :] - X2[jnp.newaxis, :, :]) ** 2, axis=-1)
+        sq_norm = jnp.sum((X1 - X2) ** 2, axis=-1)
         return jnp.exp(-0.5 * sq_norm / params[0] ** 2)
     elif len(params) == X1.shape[-1]:
         # ARD (automatic relevance determination) kernel with length scales = params
-        sq_diff = (X1[:, jnp.newaxis, :] - X2[jnp.newaxis, :, :]) ** 2
+        sq_diff = (X1 - X2) ** 2
         return jnp.exp(-0.5 * jnp.sum(sq_diff / params ** 2, axis=-1))
     else:
         raise ValueError("Incorrect number of parameters for RBF kernel")
@@ -123,12 +139,12 @@ def rbf_kernel(X1, X2, params):
 def matern12(X1, X2, params):
     if len(params) == 1:
         # isotropic Matern kernel with length scale = params[0]
-        sq_norm = jnp.sum((X1[:, jnp.newaxis, :] - X2[jnp.newaxis, :, :]) ** 2, axis=-1)
+        sq_norm = jnp.sum((X1 - X2) ** 2, axis=-1)
         norm = jnp.sqrt(sq_norm)
         return jnp.exp(-norm / params[0])
     elif len(params) == X1.shape[-1]:
         # ARD (automatic relevance determination) kernel with length scales = params
-        sq_diff = (X1[:, jnp.newaxis, :] - X2[jnp.newaxis, :, :]) ** 2
+        sq_diff = (X1 - X2) ** 2
         sq_diff /= params ** 2
         norm = jnp.sqrt(jnp.sum(sq_diff, axis=-1))
         return jnp.exp(-norm)
@@ -139,12 +155,12 @@ def matern12(X1, X2, params):
 def matern32(X1, X2, params):
     if len(params) == 1:
         # isotropic Matern kernel with length scale = params[0]
-        sq_norm = jnp.sum((X1[:, jnp.newaxis, :] - X2[jnp.newaxis, :, :]) ** 2, axis=-1)
+        sq_norm = jnp.sum((X1 - X2) ** 2, axis=-1)
         norm = jnp.sqrt(sq_norm)
         return (1.0 + jnp.sqrt(3.0) * norm / params[0]) * jnp.exp(-jnp.sqrt(3.0) * norm / params[0])
     elif len(params) == X1.shape[-1]:
         # ARD (automatic relevance determination) kernel with length scales = params
-        sq_diff = (X1[:, jnp.newaxis, :] - X2[jnp.newaxis, :, :]) ** 2
+        sq_diff = (X1 - X2) ** 2
         sq_diff /= params ** 2
         norm = jnp.sqrt(jnp.sum(sq_diff, axis=-1))
         return (1.0 + jnp.sqrt(3.0) * norm) * jnp.exp(-jnp.sqrt(3.0) * norm)
@@ -154,13 +170,13 @@ def matern32(X1, X2, params):
 def matern52(X1, X2, params):
     if len(params) == 1:
         # isotropic Matern kernel with length scale = params[0]
-        sq_norm = jnp.sum((X1[:, jnp.newaxis, :] - X2[jnp.newaxis, :, :]) ** 2, axis=-1)
+        sq_norm = jnp.sum((X1 - X2) ** 2, axis=-1)
         norm = jnp.sqrt(sq_norm)
         inner = jnp.sqrt(5.0) * norm / params[0]
         return (1.0 + inner + 5.0 / 3.0 * sq_norm / (params[0] ** 2)) * jnp.exp(-inner)
     elif len(params) == X1.shape[-1]:
         # ARD (automatic relevance determination) kernel with length scales = params
-        sq_diff = (X1[:, jnp.newaxis, :] - X2[jnp.newaxis, :, :]) ** 2
+        sq_diff = (X1 - X2) ** 2
         sq_diff /= params ** 2
         norm = jnp.sqrt(jnp.sum(sq_diff, axis=-1))
         inner = jnp.sqrt(5.0) * norm
@@ -171,12 +187,12 @@ def matern52(X1, X2, params):
 def exp_sine_squared(X1, X2, params):
     if len(params) == 2:
         # isotropic ExpSineSquared kernel with length scale = params[0] and period = params[1]
-        sq_norm = jnp.sum((X1[:, jnp.newaxis, :] - X2[jnp.newaxis, :, :]) ** 2, axis=-1)
+        sq_norm = jnp.sum((X1 - X2) ** 2, axis=-1)
         norm = jnp.sqrt(sq_norm)
         return jnp.exp(-2 * jnp.sin(jnp.pi * norm / params[1]) ** 2 / params[0] ** 2)
     elif len(params) == X1.shape[-1] + 1:
         # ARD ExpSineSquared kernel with length scales = params[:-1] and period = params[-1]
-        sq_diff = (X1[:, jnp.newaxis, :] - X2[jnp.newaxis, :, :]) ** 2
+        sq_diff = (X1 - X2) ** 2
         sq_diff /= params[:-1] ** 2
         norm = jnp.sqrt(jnp.sum(sq_diff, axis=-1))
         return jnp.exp(-2 * jnp.sin(jnp.pi * norm / params[-1]) ** 2 / jnp.sum(params[:-1] ** 2))
@@ -186,11 +202,11 @@ def exp_sine_squared(X1, X2, params):
 def rational_quadratic(X1, X2, params):
     if len(params) == 2:
         # isotropic RationalQuadratic kernel with length scale = params[0] and alpha = params[1]
-        sq_norm = jnp.sum((X1[:, jnp.newaxis, :] - X2[jnp.newaxis, :, :]) ** 2, axis=-1)
+        sq_norm = jnp.sum((X1 - X2) ** 2, axis=-1)
         return (1 + sq_norm / (2 * params[1] * params[0] ** 2)) ** (-params[1])
     elif len(params) == X1.shape[-1] + 1:
         # ARD RationalQuadratic kernel with length scales = params[:-1] and alpha = params[-1]
-        sq_diff = (X1[:, jnp.newaxis, :] - X2[jnp.newaxis, :, :]) ** 2
+        sq_diff = (X1 - X2) ** 2
         sq_diff /= params[:-1] ** 2
         sq_norm = jnp.sum(sq_diff, axis=-1)
         return (1 + sq_norm / (2 * params[-1] * jnp.sum(params[:-1] ** 2))) ** (-params[-1])
