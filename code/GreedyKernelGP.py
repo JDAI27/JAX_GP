@@ -3,7 +3,7 @@ from jax.config import config
 
 from kernel_jax import *
 from kernel_jax import Kernel
-from gp_jax import GaussianProcess
+from GaussianProcess import GaussianProcess
 config.update('jax_enable_x64', True)
 
 matern12 = jit(matern12)

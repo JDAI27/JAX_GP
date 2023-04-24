@@ -29,7 +29,7 @@ class Kernel:
         if kernel_function.__name__ == "_combined_kernel_function":
             self.kernel_function = kernel_function
         else:
-            mv = vmap(kernel_function, (0, None, None), 0)
+            mv = vmap(jit(kernel_function), (0, None, None), 0)
             self.kernel_function = vmap (mv, (None, 0, None), 1)
         self.kernel_name = kernel_name
         self.num_params = num_params
@@ -114,11 +114,12 @@ class KernelProduct(KernelOperation):
     @partial(jit, static_argnums=(0,))
     def _combined_kernel_gradient(self, X1, X2, g1, g2):
         return jnp.append(self.kernel1.kernel_function(X1, X2,self.param_values[:self.k1_num])[:,:,jnp.newaxis] * g2, 
-                          self.kernel2.kernel_function(X1, X2,self.param_values[self.k1_num:][:,:,jnp.newaxis] * g1,axis=2))
+                          self.kernel2.kernel_function(X1, X2,self.param_values[self.k1_num:])[:,:,jnp.newaxis] * g1,axis=2)
     
     def _combined_kernel_name(self,):
         self.kernel_gradient = jit(lambda X1, X2, params: jnp.append(self.kernel1.kernel_function(X1, X2,params[:self.k1_num])[:,:,jnp.newaxis] * self.kernel2.kernel_gradient(X1, X2,params[self.k1_num:]), 
-                          self.kernel2.kernel_function(X1, X2,params[self.k1_num:])[:,:,jnp.newaxis] * self.kernel1.kernel_gradient(X1, X2,params[:self.k1_num]),axis=2))
+                                    self.kernel2.kernel_function(X1, X2,params[self.k1_num:])[:,:,jnp.newaxis] * self.kernel1.kernel_gradient(X1, X2,params[:self.k1_num]),
+                                    axis=2))
         return '('+self.kernel1.kernel_name+') * ('+self.kernel2.kernel_name +')'
 
 
