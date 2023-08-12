@@ -1,6 +1,6 @@
 import jax.numpy as jnp
 #import numpy as np
-from jax import jacfwd,grad, jit, vmap
+from jax import jacrev,grad, jit, vmap
 from functools import partial
 
 
@@ -31,11 +31,15 @@ class Kernel:
         else:
             mv = vmap(jit(kernel_function), (0, None, None), 0)
             self.kernel_function = vmap (mv, (None, 0, None), 1)
+            #mv = vmap(jit(kernel_function), in_axes=(0, 0, None), out_axes=0)
+            #self.kernel_function = vmap(mv, in_axes=(None, 0, None), out_axes=1)
         self.kernel_name = kernel_name
         self.num_params = num_params
         self.param_values = jnp.array(param_values)
         self.param_bounds = param_bounds
         self.eval_gradient = eval_gradient
+
+
 
         if eval_gradient and kernel_function.__name__ != "_combined_kernel_function":
             #self.kernel_gradient = jit(jacfwd(kernel_function,argnums=2))
@@ -44,14 +48,19 @@ class Kernel:
             mv = vmap(g_kernel, (0, None, None), 0)
             self.kernel_gradient = vmap (mv, (None, 0, None), 1)
 
-    def __call__(self, X1, X2):
+    def __call__(self, X1, X2 = None):
         """It computes the kernel function with the given input points X1 and X2 and the current kernel parameter values."""
+        if X2 == None:
+            X2 = X1
         return self.kernel_function(X1, X2, self.param_values)
 
-    def gradient(self, X1, X2):
+    def gradient(self, X1, X2, params = None):
+        """It computes the gradient of the kernel function with respect to the kernel parameters."""
         if not self.eval_gradient:
             raise ValueError("Gradient evaluation is not enabled for this kernel")
-        return self.kernel_gradient(X1, X2, self.param_values)
+        if params is None:
+            params = self.param_values
+        return self.kernel_gradient(X1, X2, params)
 
     def __add__(self, other_kernel):
         return KernelSum(self, other_kernel)
@@ -77,9 +86,11 @@ class KernelOperation(Kernel):
         super().__init__(self._combined_kernel_function, num_params, param_values, param_bounds, eval_gradient,self._combined_kernel_name())
 
     @partial(jit, static_argnums=(0,))
-    def gradient(self, X1, X2):
-        g1 = self.kernel1.kernel_gradient(X1, X2,self.param_values[:self.k1_num])
-        g2 = self.kernel2.kernel_gradient(X1, X2,self.param_values[self.k1_num:])
+    def gradient(self, X1, X2,params = None):
+        if params is None:
+            params = self.param_values
+        g1 = self.kernel1.kernel_gradient(X1, X2, params[:self.k1_num])
+        g2 = self.kernel2.kernel_gradient(X1, X2, params[self.k1_num:])
         return self._combined_kernel_gradient(X1, X2, g1, g2)
 
     def _combined_kernel_function(self, X1, X2, params):
@@ -121,6 +132,95 @@ class KernelProduct(KernelOperation):
                                     self.kernel2.kernel_function(X1, X2,params[self.k1_num:])[:,:,jnp.newaxis] * self.kernel1.kernel_gradient(X1, X2,params[:self.k1_num]),
                                     axis=2))
         return '('+self.kernel1.kernel_name+') * ('+self.kernel2.kernel_name +')'
+
+
+class ICMKernel(Kernel):
+    def __init__(self, base_kernel, rank,output_dim, icm_param_bound = None, **kwargs):
+        """
+        Initialize the ICM kernel.
+        base_kernel: An instance of the Kernel class, which will be used as the base kernel function.
+        output_dim: The number of outputs (i.e., the dimensionality of the coregionalization matrix).
+        """
+        self.base_kernel = base_kernel
+        self.output_dim = output_dim
+        self.rank = rank
+
+        # Concatenate the coregionalization matrix parameters with the base kernel parameters
+        self.param_values = jnp.concatenate([base_kernel.param_values, jnp.ones(rank*output_dim).flatten()])
+        if icm_param_bound is None:
+            icm_param_bound = [(0, None)] * (rank * output_dim)
+        self.param_bounds = base_kernel.param_bounds + icm_param_bound
+
+        super().__init__(kernel_function=self._combined_kernel_function,
+                        num_params=len(self.param_values),
+                        param_values=self.param_values,
+                        param_bounds=self.param_bounds,
+                        **kwargs)
+
+    @partial(jit, static_argnums=(0,))
+    def _combined_kernel_function(self, X1, X2 = None, params=None):
+        """
+        Compute the ICM kernel function between input points.
+
+        X, X2: Input points.
+        params: Optional parameter values, including the coregionalization matrix.
+        """
+        if params is None:
+            params = self.param_values
+        
+        if X2 is None:
+            X2 = X1
+
+        X1_out = X1[:,-1].flatten().astype(jnp.int32)
+        X2_out = X2[:,-1].flatten().astype(jnp.int32)
+
+        base_kernel_params = params[:-self.output_dim * self.rank]
+        
+        W_params = params[-self.output_dim * self.rank:].reshape(self.output_dim, self.rank)
+
+        compute_B_params = jit(lambda W: jnp.dot(W, W.T)[X1_out[:, None], X2_out])
+        B_params = compute_B_params(W_params)
+
+        # Compute the base kernel function
+        K_base = self.base_kernel.kernel_function(X1[:,:-1], X2[:,:-1], jnp.array(base_kernel_params))
+
+        #print(K_base.shape)
+        #print(B_params.shape)
+        # Compute the ICM kernel function
+        K_icm = K_base * B_params
+        return K_icm
+
+    @partial(jit, static_argnums=(0,))
+    def gradient(self, X1, X2 = None,params=None):
+        if params is None:
+            params = self.param_values
+
+        if X2 is None:
+            X2 = X1
+
+        base_kernel_params = params[:-self.output_dim * self.rank]
+        W_params = params[-self.output_dim * self.rank:].reshape(self.output_dim, self.rank)
+
+        B_params = jnp.dot(W_params, W_params.T)
+        K_base = self.base_kernel.kernel_function(X1[:,:-1], X2[:,:-1], base_kernel_params)
+        K_base_gradient = self.base_kernel.kernel_gradient(X1[:,:-1], X2[:,:-1], base_kernel_params)
+
+        # Compute the gradient of the ICM kernel function
+        X1_out = X1[:,-1].flatten().astype(jnp.int32)
+        X2_out = X2[:,-1].flatten().astype(jnp.int32)
+        compute_B_params = jit(lambda W: jnp.dot(W, W.T)[X1_out[:, None], X2_out])
+        B_params = compute_B_params(W_params)
+        gradient_W_B = jit(jacrev(compute_B_params, argnums=0))
+        B_params_gradient = gradient_W_B(W_params).reshape(X1.shape[0], X2.shape[0], self.output_dim*self.rank)
+        #print("Shape of K_base:", K_base.shape)
+        #print("Shape of K_base_gradient:", K_base_gradient.shape)
+        #print("Shape of B_params:", B_params.shape)
+        #print("Shape of B_params_gradient:", B_params_gradient.shape)
+        g1 = g1 = (K_base_gradient * B_params[..., None])
+        g2 = (K_base[..., None] * B_params_gradient)
+        return jnp.append(g1, g2,axis=2)
+        # Implementation depends on the desired gradient structure
+        #raise NotImplementedError("Gradient computation not implemented for ICM kernel")
 
 
 def rbf_kernel(X1, X2, params):
